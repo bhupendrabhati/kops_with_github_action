@@ -55,7 +55,7 @@ jobs:
             -var="aws_region=${{ inputs.aws_region }}" \
             -var="environment=${{ inputs.environment }}"           
       
-      - name: Read created backend outputs (final robust)
+      - name: Read created backend outputs
         id: state
         run: |
           set -euo pipefail
@@ -68,30 +68,39 @@ jobs:
           fi
 
           # Capture terraform -json output (suppress stderr)
-          terraform -chdir=infra-bootstrap output -json > /tmp/tf_out.json 2>/dev/null || true
+          terraform -chdir=infra-bootstrap output -json > /tmp/tf_out.raw 2>/dev/null || true
 
-          # Defensive: remove any runner debug lines that begin with ::debug::
-          sed '/^::debug::/d' /tmp/tf_out.json > /tmp/tf_out.clean.json || true
+          # Defensive cleanup:
+          # 1) remove runner debug lines starting with ::debug::
+          # 2) remove any leading lines before the first '{' (some runners echo the command path)
+          sed '/^::debug::/d' /tmp/tf_out.raw > /tmp/tf_out.step1 || true
+          sed -n '/{/,${p;}' /tmp/tf_out.step1 > /tmp/tf_out.clean || true
 
           echo "---- cleaned terraform output preview (first 200 chars) ----"
-          head -c 200 /tmp/tf_out.clean.json || true
+          head -c 200 /tmp/tf_out.clean || true
           echo
-          
-          # Try to extract values using jq. If missing, fail and print the cleaned JSON for debugging.
-          BUCKET=$(jq -r '.backend_bucket.value // empty' /tmp/tf_out.clean.json || true)
-          TABLE=$(jq -r '.dynamo_table.value // empty' /tmp/tf_out.clean.json || true)
+
+          # Validate JSON
+          if ! jq empty /tmp/tf_out.clean >/dev/null 2>&1; then
+            echo "ERROR: cleaned terraform output is not valid JSON. Dumping file:"
+            sed -n '1,200p' /tmp/tf_out.clean || true
+            exit 1
+          fi
+
+          # Extract values
+          BUCKET=$(jq -r '.backend_bucket.value // empty' /tmp/tf_out.clean)
+          TABLE=$(jq -r '.dynamo_table.value // empty' /tmp/tf_out.clean)
 
           echo "Parsed BUCKET='$BUCKET'"
           echo "Parsed TABLE='$TABLE'"
 
           if [ -z "$BUCKET" ] || [ -z "$TABLE" ]; then
-            echo "ERROR: Could not find expected outputs 'backend_bucket' and/or 'dynamo_table' in terraform output."
-            echo "Dumping cleaned json for debugging:"
-            sed -n '1,200p' /tmp/tf_out.clean.json || true
+            echo "ERROR: Could not find expected outputs 'backend_bucket' and/or 'dynamo_table'. Dumping cleaned JSON:"
+            sed -n '1,200p' /tmp/tf_out.clean || true
             exit 1
           fi
 
-          # Write outputs using Actions file-output format (handles multiline)
+          # Write outputs using Actions file-output format
           echo "bucket<<EOF" >> $GITHUB_OUTPUT
           echo "$BUCKET" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -128,3 +137,32 @@ jobs:
           git add infra-kops/backend.tf
           git commit -m "chore(bootstrap): add infra-kops backend.tf" || echo "Nothing to commit"
           git push || echo "Push failed (check token / permissions)"
+      
+      # If we reach here, the job succeeded — mark that to prevent cleanup destroy
+      - name: Mark job success
+        if: ${{ success() }}
+        run: |
+          mkdir -p infra-bootstrap
+          touch infra-bootstrap/.job_success
+          echo "job_success marker created"
+
+      # CLEANUP: always run this step, but only destroy if apply succeeded and job did NOT succeed
+      - name: Cleanup on failure (destroy infra-bootstrap if apply succeeded but job failed)
+        if: ${{ always() }}
+        run: |
+          set -euxo pipefail
+          AUTO="${{ inputs.auto_destroy_on_failure }}"
+          # Only proceed if user enabled auto-destroy
+          if [ "$AUTO" != "true" ]; then
+            echo "auto_destroy_on_failure is not true (${AUTO}) — skipping cleanup destroy"
+            exit 0
+          fi
+
+          if [ -f infra-bootstrap/.apply_success ] && [ ! -f infra-bootstrap/.job_success ]; then
+            echo "Detected apply_success marker and no job_success — destroying infra-bootstrap resources (best-effort)"
+            terraform -chdir=infra-bootstrap destroy -auto-approve || echo "terraform destroy failed (best-effort)"
+            # remove marker files for cleanliness
+            rm -f infra-bootstrap/.apply_success || true
+          else
+            echo "No destruction required (either apply didn't happen or job succeeded)."
+          fi
