@@ -1,0 +1,244 @@
+name: infra-and-kops
+
+# Triggers:
+# - run plan on pull requests (opened/synchronize/reopened)
+# - run apply only on pushes to main
+# Skip runs if only workflow files changed
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - '.github/workflows/**'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.github/workflows/**'
+  workflow_dispatch: {} # allow manual runs too
+
+env:
+  TF_DIR: infra-kops
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  # 1) Terraform plan job — runs for pull_request events (PRs)
+  terraform-plan:
+    name: Terraform Plan (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (for plan that may need provider info)
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform fmt check
+        run: terraform -chdir=${{ env.TF_DIR }} fmt -check || true
+
+      - name: Terraform init
+        run: terraform -chdir=${{ env.TF_DIR }} init -input=false
+
+      - name: Terraform validate
+        run: terraform -chdir=${{ env.TF_DIR }} validate || true
+
+      - name: Terraform plan (save plan artifact)
+        run: |
+          set -euo pipefail
+          cd "${{ env.TF_DIR }}"
+          terraform plan -out=tfplan -input=false
+          terraform show -json tfplan > tfplan.json
+        shell: bash
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            ${{ env.TF_DIR }}/tfplan
+            ${{ env.TF_DIR }}/tfplan.json
+
+  # 2) Terraform apply job — runs only on pushes to main (or manual dispatch)
+  terraform-apply:
+    name: Terraform Apply (main)
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: [terraform-plan] # plan job may not run for direct pushes, but that's OK
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Try to download tfplan artifact (if a plan job ran)
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}
+        continue-on-error: true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform -chdir=${{ env.TF_DIR }} init -input=false
+
+      - name: Terraform apply (use plan if present)
+        id: tf_apply
+        run: |
+          set -euo pipefail
+          cd "${{ env.TF_DIR }}"
+          if [ -f ./tfplan ]; then
+            echo "Applying saved plan (tfplan)..."
+            terraform apply -input=false -auto-approve ./tfplan
+          else
+            echo "No saved plan found — running terraform apply -auto-approve"
+            terraform apply -auto-approve -input=false
+          fi
+          # save outputs for next job
+          terraform output -json > ../tf_outputs.json
+        shell: bash
+
+      - name: Upload TF outputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs
+          path: tf_outputs.json
+
+  # 3) kOps create/update + nginx deploy — runs after apply
+  kops-deploy:
+    name: kOps cluster create/update & deploy
+    needs: terraform-apply
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download TF outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: tf-outputs
+          path: .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install jq, kops and kubectl
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          curl -Lo kops https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
+          chmod +x kops && sudo mv kops /usr/local/bin/
+          curl -Lo kubectl "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          kops version && kubectl version --client
+        shell: bash
+
+      - name: Read kops_state and cluster name from TF outputs
+        id: tf
+        run: |
+          if [ ! -f ./tf_outputs.json ]; then
+            echo "ERROR: tf_outputs.json not found"; exit 1
+          fi
+          KOPS_STATE_STORE=$(jq -r '.kops_state_bucket.value // empty' tf_outputs.json)
+          CLUSTER_FROM_TF=$(jq -r '.kops_cluster_name.value // empty' tf_outputs.json)
+          # allow override by repo secret CLUSTER_NAME (optional)
+          if [ -n "${{ secrets.CLUSTER_NAME || '' }}" ]; then
+            CLUSTER_NAME="${{ secrets.CLUSTER_NAME }}"
+          else
+            CLUSTER_NAME="${CLUSTER_FROM_TF}"
+          fi
+          echo "KOPS_STATE_STORE=${KOPS_STATE_STORE}" >> $GITHUB_OUTPUT
+          echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Debug detected values
+        run: |
+          echo "KOPS_STATE_STORE=${{ steps.tf.outputs.KOPS_STATE_STORE }}"
+          echo "CLUSTER_NAME=${{ steps.tf.outputs.CLUSTER_NAME }}"
+        shell: bash
+
+      - name: Write SSH pubkey if provided (create kops secret)
+        if: ${{ secrets.KOPS_SSH_PUBLIC_KEY != '' }}
+        run: |
+          echo "${{ secrets.KOPS_SSH_PUBLIC_KEY }}" > /tmp/kops.pub
+          export KOPS_STATE_STORE="${{ steps.tf.outputs.KOPS_STATE_STORE }}"
+          kops create secret --name "${{ steps.tf.outputs.CLUSTER_NAME }}" sshpublickey admin -i /tmp/kops.pub --state="${KOPS_STATE_STORE}" || true
+        env:
+          KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
+        shell: bash
+
+      - name: Create or update kops cluster (idempotent)
+        env:
+          KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
+          CLUSTER_NAME: ${{ steps.tf.outputs.CLUSTER_NAME }}
+        run: |
+          set -euo pipefail
+          # Substitute environment variables in cluster.yml template
+          if [ -f infra-kops/cluster.yml ]; then
+            echo "Preparing cluster.yml with environment variables..."
+            mkdir -p /tmp/kops-config
+            envsubst < infra-kops/cluster.yml > /tmp/kops-config/cluster-prepared.yml
+            echo "Applying prepared cluster configuration..."
+            kops replace -f /tmp/kops-config/cluster-prepared.yml --state="${KOPS_STATE_STORE}" || true
+          fi
+
+          if kops get cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" > /dev/null 2>&1; then
+            echo "Cluster exists; running update..."
+            kops update cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --yes
+          else
+            echo "Cluster not found; creating with fallback defaults"
+            # adapt zone/node-count/size to your needs
+            kops create cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --zones "ap-south-1a,ap-south-1b,ap-south-1c" --node-count 2 --node-size t3.small --yes
+          fi
+        shell: bash
+
+      - name: Export kubeconfig and validate (non-blocking)
+        env:
+          KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
+          CLUSTER_NAME: ${{ steps.tf.outputs.CLUSTER_NAME }}
+        run: |
+          set -euo pipefail
+          kops export kubeconfig --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}"
+          kubectl get nodes --no-headers || true
+          # validation can take time — log but don't fail the job if not ready
+          kops validate cluster --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" || true
+        shell: bash
+
+      - name: Deploy nginx manifests (idempotent)
+        run: |
+          kubectl apply -f infra-kops/nginx-deploy.yaml || true
+          kubectl apply -f infra-kops/nginx-svc.yaml || true
+          # wait for rollout if deployment is named 'nginx-demo'
+          kubectl rollout status deploy/nginx-demo -n default --timeout=120s || true
+        shell: bash

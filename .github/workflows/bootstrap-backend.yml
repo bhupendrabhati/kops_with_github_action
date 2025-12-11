@@ -1,0 +1,100 @@
+name: Bootstrap Terraform Backend (create S3 + DynamoDB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_bucket:
+        description: "Name of S3 bucket to create for Terraform backend (must be globally unique)"
+        required: true
+      dynamo_table:
+        description: "DynamoDB table name for locks (default terraform-locks)"
+        required: false
+        default: "terraform-locks"
+      aws_region:
+        description: "AWS region (default ap-south-1)"
+        required: false
+        default: "ap-south-1"
+      environment:
+        description: "Environment tag (default dev)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: write   # needed to commit backend.tf changes
+  id-token: write   # not required but useful if using OIDC
+  actions: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for commit)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.aws_region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapped: false
+
+      - name: Init & Apply bootstrap terraform
+        working-directory: infra-bootstrap
+        env:
+          TF_IN_AUTOMATION: "true"
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -var="backend_bucket_name=${{ github.event.inputs.backend_bucket }}" -var="dynamo_table_name=${{ github.event.inputs.dynamo_table }}" -var="aws_region=${{ github.event.inputs.aws_region }}" -var="environment=${{ github.event.inputs.environment }}"
+
+      - name: Read created backend names
+        id: read
+        run: |
+          terraform -chdir=infra-bootstrap output -json > /tmp/bootstrap_outputs.json
+          cat /tmp/bootstrap_outputs.json
+          BACKEND_BUCKET=$(jq -r '.backend_bucket.value // empty' /tmp/bootstrap_outputs.json)
+          DYNAMO_TABLE=$(jq -r '.dynamo_table.value // empty' /tmp/bootstrap_outputs.json)
+          [ -z "$BACKEND_BUCKET" ] && echo "ERROR: BACKEND_BUCKET not found in outputs" && exit 1
+          [ -z "$DYNAMO_TABLE" ] && echo "ERROR: DYNAMO_TABLE not found in outputs" && exit 1
+          echo "bucket=${BACKEND_BUCKET}" >> $GITHUB_OUTPUT
+          echo "dynamo=${DYNAMO_TABLE}" >> $GITHUB_OUTPUT
+
+      - name: Create infra-kops/backend.tf (backend config)
+        env:
+          BACKEND_BUCKET: ${{ steps.read.outputs.bucket }}
+          DYNAMO_TABLE: ${{ steps.read.outputs.dynamo }}
+          AWS_REGION: ${{ github.event.inputs.aws_region }}
+        run: |
+          cat > infra-kops/backend.tf <<EOF
+terraform {
+  backend "s3" {
+    bucket         = "$BACKEND_BUCKET"
+    key            = "infra-kops/terraform.tfstate"
+    region         = "$AWS_REGION"
+    encrypt        = true
+    dynamodb_table = "$DYNAMO_TABLE"
+  }
+}
+EOF
+          echo "Wrote infra-kops/backend.tf (do not commit sensitive values)."
+      - name: Commit backend.tf back to repo
+        env:
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+        run: |
+          set -euo pipefail
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+          git add infra-kops/backend.tf
+          git commit -m "chore: add terraform backend config (bootstrap created S3 and DynamoDB)" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref_name }} || { echo "Push failed - check permissions"; exit 1; }
+      - name: Output result
+        run: |
+          echo "Backend bucket: ${{ steps.read.outputs.bucket }}"
+          echo "DynamoDB table: ${{ steps.read.outputs.dynamo }}"

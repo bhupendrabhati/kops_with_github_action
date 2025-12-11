@@ -1,0 +1,4 @@
+Policy is intentionally permissive for demo. Production steps:
+- Replace "Resource": "*" with least-privilege ARNs
+- Limit IAM actions to only those needed (CreateInstanceProfile, PassRole, AttachRolePolicy, etc.)
+- Use IAM Roles for Service Accounts or assume-role patterns for CI

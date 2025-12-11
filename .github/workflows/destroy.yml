@@ -1,0 +1,168 @@
+name: destroy-infra-and-kops
+
+# Manual-only workflow; requires explicit confirmation to run.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type YES to confirm full destroy (required)"
+        required: true
+        default: "NO"
+      destroy_bootstrap:
+        description: "Also destroy bootstrap resources (S3 backend + DynamoDB). Type YES to destroy"
+        required: false
+        default: "NO"
+
+env:
+  TF_DIR: infra-kops
+  BOOTSTRAP_DIR: infra-bootstrap
+
+permissions:
+  contents: read
+
+jobs:
+  destroy:
+    name: Destroy kOps cluster and Terraform infra (manual)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'YES' }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail early if not confirmed
+        if: ${{ github.event.inputs.confirm != 'YES' }}
+        run: |
+          echo "Destroy not confirmed. To destroy, run this workflow and type confirm=YES"
+          exit 1
+
+      - name: Set TIMESTAMP env (UTC)
+        run: |
+          echo "TIMESTAMP=$(date -u +'%Y%m%dT%H%M%SZ')" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install tools (jq, kops, kubectl, awscli)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq unzip
+          curl -Lo kops https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
+          chmod +x kops && sudo mv kops /usr/local/bin/
+          curl -Lo kubectl "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install || true
+          kops version || true
+          kubectl version --client || true
+          aws --version || true
+        shell: bash
+
+      - name: Initialize terraform (infra-kops) to read outputs
+        run: |
+          set -euxo pipefail
+          terraform -chdir=${{ env.TF_DIR }} init -input=false || true
+          terraform -chdir=${{ env.TF_DIR }} output -json > tf_outputs.json || true
+        shell: bash
+
+      - name: Read TF outputs for kops info
+        id: tf
+        run: |
+          if [ -f tf_outputs.json ]; then
+            KOPS_STATE_STORE=$(jq -r '.kops_state_bucket.value // empty' tf_outputs.json)
+            CLUSTER_NAME=$(jq -r '.kops_cluster_name.value // empty' tf_outputs.json)
+            echo "KOPS_STATE_STORE=${KOPS_STATE_STORE}" >> $GITHUB_OUTPUT
+            echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "tf_outputs.json not found — trying terraform output directly"
+            KOPS_STATE_STORE=$(terraform -chdir=${{ env.TF_DIR }} output -raw kops_state_bucket 2>/dev/null || true)
+            CLUSTER_NAME=$(terraform -chdir=${{ env.TF_DIR }} output -raw kops_cluster_name 2>/dev/null || true)
+            echo "KOPS_STATE_STORE=${KOPS_STATE_STORE}" >> $GITHUB_OUTPUT
+            echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Debug detected values
+        run: |
+          echo "TIMESTAMP=${{ env.TIMESTAMP }}"
+          echo "KOPS_STATE_STORE='${{ steps.tf.outputs.KOPS_STATE_STORE }}'"
+          echo "CLUSTER_NAME='${{ steps.tf.outputs.CLUSTER_NAME }}'"
+        shell: bash
+
+      - name: Delete kops cluster (if values present)
+        env:
+          KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
+          CLUSTER_NAME: ${{ steps.tf.outputs.CLUSTER_NAME }}
+        run: |
+          set -euxo pipefail
+          if [ -n "${CLUSTER_NAME}" ] && [ -n "${KOPS_STATE_STORE}" ]; then
+            echo "Deleting kops cluster ${CLUSTER_NAME} with state ${KOPS_STATE_STORE} ..."
+            kops delete cluster --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" --yes || true
+            echo "Attempting to remove kops state objects from ${KOPS_STATE_STORE} (best-effort) ..."
+            if echo "${KOPS_STATE_STORE}" | grep '^s3://' >/dev/null 2>&1; then
+              BUCKET=$(echo "${KOPS_STATE_STORE}" | sed 's|s3://||; s|/.*||')
+              aws s3 rm --recursive "s3://${BUCKET}/${CLUSTER_NAME}" || true
+            fi
+          else
+            echo "Cluster name or kops state store not found; skipping kops delete."
+          fi
+        shell: bash
+
+      - name: Terraform destroy infra-kops (destroy resources)
+        run: |
+          set -euxo pipefail
+          cd "${{ env.TF_DIR }}"
+          terraform plan -destroy -out=tfdestroy -input=false || true
+          if [ -f tfdestroy ]; then
+            terraform apply -auto-approve tfdestroy || terraform destroy -auto-approve -input=false || true
+          else
+            terraform destroy -auto-approve -input=false || true
+          fi
+        shell: bash
+
+      - name: Optionally destroy bootstrap resources (S3 backend + DynamoDB)
+        if: ${{ github.event.inputs.destroy_bootstrap == 'YES' }}
+        run: |
+          set -euxo pipefail
+          echo "Destroying bootstrap resources in ${BOOTSTRAP_DIR} (S3 + DynamoDB)."
+          if [ -d "${{ env.BOOTSTRAP_DIR }}" ]; then
+            cd "${{ env.BOOTSTRAP_DIR }}"
+            terraform init -input=false || true
+            terraform plan -destroy -out=tfdestroy -input=false || true
+            if [ -f tfdestroy ]; then
+              terraform apply -auto-approve tfdestroy || terraform destroy -auto-approve -input=false || true
+            else
+              terraform destroy -auto-approve -input=false || true
+            fi
+          else
+            echo "Bootstrap dir '${{ env.BOOTSTRAP_DIR }}' not found — skipping bootstrap destroy"
+          fi
+        shell: bash
+
+      - name: Run post-destroy checklist scanner (create .txt + .html)
+        run: |
+          mkdir -p reports/${{ env.TIMESTAMP }}
+          chmod +x scripts/post_destroy_checklist.sh
+          # produce text report
+          ./scripts/post_destroy_checklist.sh --region "${{ secrets.AWS_REGION }}" --output-file ./reports/${{ env.TIMESTAMP }}/post_destroy_report.txt
+          # produce a simple HTML wrapper (preformatted) from the text report
+          echo "<!doctype html><html><head><meta charset='utf-8'><title>Post-destroy report - ${{ env.TIMESTAMP }}</title></head><body><h2>Post-destroy report - ${{ env.TIMESTAMP }}</h2><pre>" > ./reports/${{ env.TIMESTAMP }}/post_destroy_report.html
+          sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' ./reports/${{ env.TIMESTAMP }}/post_destroy_report.txt >> ./reports/${{ env.TIMESTAMP }}/post_destroy_report.html
+          echo "</pre></body></html>" >> ./reports/${{ env.TIMESTAMP }}/post_destroy_report.html
+        shell: bash
+
+      - name: Upload post-destroy report artifact (timestamped folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-destroy-report
+          path: reports/${{ env.TIMESTAMP }}
+          retention-days: 30

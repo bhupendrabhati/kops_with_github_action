@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:*",
+        "elasticloadbalancing:*",
+        "autoscaling:*",
+        "route53:*",
+        "iam:CreateServiceLinkedRole",
+        "iam:ListInstanceProfiles",
+        "iam:PassRole",
+        "s3:*",
+        "kms:*",
+        "cloudformation:*",
+        "tag:GetResources",
+        "tag:GetTagKeys",
+        "tag:GetTagValues",
+        "logs:*",
+        "cloudwatch:*",
+        "sts:AssumeRole"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
