@@ -19,6 +19,9 @@ on:
         required: false
         default: "dev"
 
+permissions:
+  contents: write
+
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
@@ -55,8 +58,26 @@ jobs:
       - name: Read created backend outputs
         id: state
         run: |
-          echo "bucket=$(terraform -chdir=infra-bootstrap output -raw backend_bucket)" >> $GITHUB_OUTPUT || true
-          echo "table=$(terraform -chdir=infra-bootstrap output -raw dynamo_table)" >> $GITHUB_OUTPUT || true
+          set -euxo pipefail
+
+          # Try to read raw outputs; tolerate any debug/wrapper lines by taking last non-empty line
+          BUCKET_RAW=$(terraform -chdir=infra-bootstrap output -raw backend_bucket 2>/dev/null || true)
+          BUCKET=$(printf '%s\n' "$BUCKET_RAW" | awk 'NF{line=$0} END{print line}')
+
+          TABLE_RAW=$(terraform -chdir=infra-bootstrap output -raw dynamo_table 2>/dev/null || true)
+          TABLE=$(printf '%s\n' "$TABLE_RAW" | awk 'NF{line=$0} END{print line}')
+
+          echo "Detected backend bucket: '${BUCKET}'"
+          echo "Detected dynamo table: '${TABLE}'"
+
+          # Write outputs using the GitHub Actions file-output format (safe for multiline)
+          echo "bucket<<EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "$BUCKET" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "table<<EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "$TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create backend.tf for infra-kops
         run: |
@@ -68,10 +89,15 @@ jobs:
               key            = "kops/terraform.tfstate"
               region         = "${{ inputs.aws_region }}"
               dynamodb_table = "${{ steps.state.outputs.table }}"
-                encrypt        = true
+              encrypt        = true
             }
           }
           EOF
+
+      - name: Show backend.tf (for logs / debug)
+        run: |
+          echo "---- infra-kops/backend.tf ----"
+          sed -n '1,200p' infra-kops/backend.tf || true
 
       - name: Commit backend.tf
         run: |
