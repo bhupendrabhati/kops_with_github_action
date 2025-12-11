@@ -242,3 +242,82 @@ jobs:
           # wait for rollout if deployment is named 'nginx-demo'
           kubectl rollout status deploy/nginx-demo -n default --timeout=120s || true
         shell: bash
+
+      # mark overall job success (so that cleanup step won't destroy resources)
+      - name: Mark job success
+        if: ${{ success() }}
+        run: |
+          mkdir -p .gha_markers
+          echo "job_success" > .gha_markers/job_success
+          ls -la .gha_markers || true
+
+      # FINAL CLEANUP: run always, and destroy infra if apply succeeded but job did not succeed
+      - name: Cleanup on failure — destroy infra & kOps cluster (best-effort)
+        if: ${{ always() }}
+        env:
+          TF_DIR: ${{ env.TF_DIR }}
+        run: |
+          set -euxo pipefail
+          MARKER_DIR=".gha_markers"
+          APPLY_MARKER="${MARKER_DIR}/apply_success"
+          JOB_MARKER="${MARKER_DIR}/job_success"
+
+          # If apply marker not present, nothing to destroy
+          if [ ! -f "${APPLY_MARKER}" ]; then
+            echo "No apply marker found — nothing to destroy."
+            exit 0
+          fi
+
+          # If markers show job succeeded, skip destroy
+          if [ -f "${JOB_MARKER}" ]; then
+            echo "Job succeeded; skipping cleanup destroy."
+            exit 0
+          fi
+
+          echo "Detected failed job after apply — running best-effort cleanup."
+
+          # read tf_outputs.json if available to get KOPS state and cluster name
+          if [ -f ./tf_outputs.json ]; then
+            KOPS_STATE_STORE=$(jq -r '.kops_state_bucket.value // empty' ./tf_outputs.json || true)
+            CLUSTER_NAME=$(jq -r '.kops_cluster_name.value // empty' ./tf_outputs.json || true)
+            echo "Detected KOPS_STATE_STORE='${KOPS_STATE_STORE}' CLUSTER_NAME='${CLUSTER_NAME}'"
+          else
+            echo "tf_outputs.json not found; attempting to derive from terraform state (best-effort)"
+            # attempt to init and read outputs from TF_DIR
+            terraform -chdir="${TF_DIR}" init -input=false || true
+            terraform -chdir="${TF_DIR}" output -json > /tmp/tf_out.json || true
+            if [ -f /tmp/tf_out.json ]; then
+              KOPS_STATE_STORE=$(jq -r '.kops_state_bucket.value // empty' /tmp/tf_out.json || true)
+              CLUSTER_NAME=$(jq -r '.kops_cluster_name.value // empty' /tmp/tf_out.json || true)
+              echo "Derived KOPS_STATE_STORE='${KOPS_STATE_STORE}' CLUSTER_NAME='${CLUSTER_NAME}'"
+            fi
+          fi
+
+          # Try deleting kOps cluster (best-effort)
+          if [ -n "${KOPS_STATE_STORE:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
+            echo "Attempting to delete kOps cluster ${CLUSTER_NAME} in state store ${KOPS_STATE_STORE} ..."
+            # install kops if missing
+            if ! command -v kops >/dev/null 2>&1; then
+              curl -Lo kops https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
+              chmod +x kops && sudo mv kops /usr/local/bin/
+            fi
+            kops delete cluster --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" --yes || echo "kops delete failed (best-effort)"
+            # attempt to remove kops state objects from S3 (best-effort)
+            if echo "${KOPS_STATE_STORE}" | grep -q '^s3://'; then
+              BUCKET=$(echo "${KOPS_STATE_STORE}" | sed 's|s3://||; s|/.*||')
+              aws s3 rm --recursive "s3://${BUCKET}/${CLUSTER_NAME}" || echo "Failed to remove kops state objects (best-effort)"
+            fi
+          else
+            echo "No kOps state or cluster name detected; skipping kOps delete."
+          fi
+
+          # Now destroy Terraform-managed infra in TF_DIR
+          echo "Running terraform destroy in ${TF_DIR} (best-effort)"
+          terraform -chdir="${TF_DIR}" plan -destroy -out=destroy.plan -input=false || true
+          if [ -f "${TF_DIR}/destroy.plan" ]; then
+            terraform -chdir="${TF_DIR}" apply -auto-approve destroy.plan || terraform -chdir="${TF_DIR}" destroy -auto-approve || echo "Terraform destroy failed (best-effort)"
+          else
+            terraform -chdir="${TF_DIR}" destroy -auto-approve || echo "Terraform destroy failed (best-effort)"
+          fi
+
+          echo "Cleanup finished."
