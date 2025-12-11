@@ -194,41 +194,30 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Install jq, kops and kubectl
+      - name: Install jq, kops and kubectl (robust)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
           sudo apt-get update -y
-          sudo apt-get install -y jq unzip ca-certificates
+          sudo apt-get install -y jq unzip ca-certificates curl
 
-          # --- install kops (follow redirects, verify binary signature lightly) ---
-          KOPS_URL="https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64"
-          echo "Downloading kops from ${KOPS_URL}"
-          curl -sSL -o /tmp/kops.bin "${KOPS_URL}"
-          # quick sanity check: file should be an ELF binary
-          file /tmp/kops.bin || true
-          # make executable and move into PATH
+          # Install kops (stable release)
+          KOPS_BIN="/usr/local/bin/kops"
+          curl --fail --retry 5 --retry-delay 2 --connect-timeout 15 -Lo /tmp/kops.bin \
+          "https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64"
           chmod +x /tmp/kops.bin
-          sudo mv /tmp/kops.bin /usr/local/bin/kops
+          sudo mv /tmp/kops.bin "${KOPS_BIN}"
+          "${KOPS_BIN}" version || true
 
-          # verify it's executable
-          if ! command -v kops >/dev/null 2>&1; then
-            echo "kops not found after install"
-            ls -l /usr/local/bin/kops || true
-            tail -n +1 /usr/local/bin/kops | sed -n '1,4p' || true
-            exit 1
-          fi
-          kops version || true
-
-          # --- install kubectl (stable release) ---
-          KUBE_VER=$(curl -L -s https://dl.k8s.io/release/stable.txt)
-          echo "Downloading kubectl ${KUBE_VER}"
-          curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBE_VER}/bin/linux/amd64/kubectl"
+          # Install kubectl (stable release) with retries and IPv4 fallback
+          KUBECTL_URL="https://dl.k8s.io/release/$(curl -LfsS --retry 5 https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          curl --fail --retry 5 --retry-delay 2 --connect-timeout 15 -Lo /tmp/kubectl "${KUBECTL_URL}" || \
+          curl --ipv4 --fail --retry 5 --retry-delay 2 --connect-timeout 15 -Lo /tmp/kubectl "${KUBECTL_URL}"
           chmod +x /tmp/kubectl
           sudo mv /tmp/kubectl /usr/local/bin/kubectl
           kubectl version --client || true
-
         shell: bash
+
 
 
       - name: Read kops_state and cluster name from TF outputs
