@@ -121,6 +121,9 @@ jobs:
           fi
           # save outputs for next job
           terraform output -json > ../tf_outputs.json
+          # mark that apply succeeded (marker file in workspace)
+          mkdir -p ../.gha_markers
+          echo "apply_success" > ../.gha_markers/apply_success
         shell: bash
 
       - name: Upload TF outputs artifact
@@ -172,12 +175,14 @@ jobs:
           fi
           KOPS_STATE_STORE=$(jq -r '.kops_state_bucket.value // empty' tf_outputs.json)
           CLUSTER_FROM_TF=$(jq -r '.kops_cluster_name.value // empty' tf_outputs.json)
-          # allow override by repo secret CLUSTER_NAME (optional)
-          if [ -n "${{ secrets.CLUSTER_NAME || '' }}" ]; then
+
+          # prefer an explicit secret override if you set CLUSTER_NAME in Secrets; expand safely
+          if [ -n "${{ secrets.CLUSTER_NAME }}" ]; then
             CLUSTER_NAME="${{ secrets.CLUSTER_NAME }}"
           else
             CLUSTER_NAME="${CLUSTER_FROM_TF}"
           fi
+
           echo "KOPS_STATE_STORE=${KOPS_STATE_STORE}" >> $GITHUB_OUTPUT
           echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
         shell: bash
@@ -188,12 +193,17 @@ jobs:
           echo "CLUSTER_NAME=${{ steps.tf.outputs.CLUSTER_NAME }}"
         shell: bash
 
-      - name: Write SSH pubkey if provided (create kops secret)
-        if: ${{ secrets.KOPS_SSH_PUBLIC_KEY != '' }}
+      - name: Write SSH pubkey if provided (create kops secret) - safe runtime check
         run: |
-          echo "${{ secrets.KOPS_SSH_PUBLIC_KEY }}" > /tmp/kops.pub
-          export KOPS_STATE_STORE="${{ steps.tf.outputs.KOPS_STATE_STORE }}"
-          kops create secret --name "${{ steps.tf.outputs.CLUSTER_NAME }}" sshpublickey admin -i /tmp/kops.pub --state="${KOPS_STATE_STORE}" || true
+          # If the secret is set, create the kops SSH secret; otherwise skip gracefully.
+          if [ -n "${{ secrets.KOPS_SSH_PUBLIC_KEY }}" ]; then
+            echo "Writing provided KOPS_SSH_PUBLIC_KEY to temp file and creating kops secret..."
+            echo "${{ secrets.KOPS_SSH_PUBLIC_KEY }}" > /tmp/kops.pub
+            export KOPS_STATE_STORE="${{ steps.tf.outputs.KOPS_STATE_STORE }}"
+            kops create secret --name "${{ steps.tf.outputs.CLUSTER_NAME }}" sshpublickey admin -i /tmp/kops.pub --state="${KOPS_STATE_STORE}" || true
+          else
+            echo "No KOPS_SSH_PUBLIC_KEY found in secrets; skipping kops secret creation."
+          fi
         env:
           KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
         shell: bash
@@ -295,7 +305,7 @@ jobs:
 
           # Try deleting kOps cluster (best-effort)
           if [ -n "${KOPS_STATE_STORE:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
-            echo "Attempting to delete kOps cluster ${CLUSTER_NAME} in state store ${KOPS_STATE_STORE} ..."
+            echo "Attempting to delete kops cluster ${CLUSTER_NAME} in state store ${KOPS_STATE_STORE} ..."
             # install kops if missing
             if ! command -v kops >/dev/null 2>&1; then
               curl -Lo kops https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
