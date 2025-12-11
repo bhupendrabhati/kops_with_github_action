@@ -8,16 +8,13 @@ resource "aws_s3_bucket" "kops_state" {
   }
 }
 
-resource "aws_s3_bucket_acl" "kops_state" {
-  bucket = aws_s3_bucket.kops_state.id
-  acl    = "private"
-}
+# ❌ Removed ACL resource – ACLs are not supported by S3 BucketOwnerEnforced mode
 
 resource "aws_s3_bucket_versioning" "kops_state" {
   bucket = aws_s3_bucket.kops_state.id
 
   versioning_configuration {
-    status = "Disabled"
+    status = "Suspended"   # Versioning disabled safely
   }
 }
 
@@ -33,6 +30,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "kops_state" {
 
 resource "aws_s3_bucket_public_access_block" "kops_state" {
   bucket = aws_s3_bucket.kops_state.id
+
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
