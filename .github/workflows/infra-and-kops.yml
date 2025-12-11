@@ -78,7 +78,7 @@ jobs:
     name: Terraform Apply (main)
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: [terraform-plan] # plan job may not run for direct pushes, but that's OK
+    #needs: [terraform-plan] # plan job may not run for direct pushes, but that's OK
     steps:
       - name: Checkout
         uses: actions/checkout@v4
