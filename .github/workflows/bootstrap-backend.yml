@@ -58,40 +58,37 @@ jobs:
       - name: Read created backend outputs
         id: state
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          # Try to read raw outputs; tolerate any debug/wrapper lines by taking last non-empty line
-          BUCKET_RAW=$(terraform -chdir=infra-bootstrap output -raw backend_bucket 2>/dev/null || true)
-          BUCKET=$(printf '%s\n' "$BUCKET_RAW" | awk 'NF{line=$0} END{print line}')
-
-          TABLE_RAW=$(terraform -chdir=infra-bootstrap output -raw dynamo_table 2>/dev/null || true)
-          TABLE=$(printf '%s\n' "$TABLE_RAW" | awk 'NF{line=$0} END{print line}')
+          # Read outputs and take the last non-empty line (defensive against wrapper noise)
+          BUCKET=$(terraform -chdir=infra-bootstrap output backend_bucket | awk 'NF{line=$0} END{print line}')
+          TABLE=$(terraform -chdir=infra-bootstrap output dynamo_table | awk 'NF{line=$0} END{print line}')
 
           echo "Detected backend bucket: '${BUCKET}'"
           echo "Detected dynamo table: '${TABLE}'"
 
-          # Write outputs using the GitHub Actions file-output format (safe for multiline)
+          # Write outputs using the Actions file-output format (safe for multiline)
           echo "bucket<<EOF" >> $GITHUB_OUTPUT
-          printf '%s\n' "$BUCKET" >> $GITHUB_OUTPUT
+          echo "$BUCKET" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
           echo "table<<EOF" >> $GITHUB_OUTPUT
-          printf '%s\n' "$TABLE" >> $GITHUB_OUTPUT
+          echo "$TABLE" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create backend.tf for infra-kops
         run: |
           mkdir -p infra-kops
           cat <<'EOF' > infra-kops/backend.tf
-          terraform {
-            backend "s3" {
-              bucket         = "${{ steps.state.outputs.bucket }}"
-              key            = "kops/terraform.tfstate"
-              region         = "${{ inputs.aws_region }}"
-              dynamodb_table = "${{ steps.state.outputs.table }}"
-              encrypt        = true
+            terraform {
+              backend "s3" {
+                bucket         = "${{ steps.state.outputs.bucket }}"
+                key            = "kops/terraform.tfstate"
+                region         = "${{ inputs.aws_region }}"
+                dynamodb_table = "${{ steps.state.outputs.table }}"
+                encrypt        = true
+              }
             }
-          }
           EOF
 
       - name: Show backend.tf (for logs / debug)
