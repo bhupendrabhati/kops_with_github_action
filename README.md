@@ -1,6 +1,8 @@
-#IDP: Terraform + KOPS + Nginx (AWS ap-south-1)
+# IDP: Terraform + KOPS + Nginx (AWS ap-south-1)
 
 **Folder Structure**
+
+```
 my-repo/
 │
 ├── infra-kops/
@@ -27,3 +29,4 @@ my-repo/
           ├── bootstrap-backend.yml
           ├── infra-and-kops.yml
           └── destroy.yml
+```
