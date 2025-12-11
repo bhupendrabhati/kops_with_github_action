@@ -1,9 +1,9 @@
   terraform {
     backend "s3" {
-      bucket         = "::debug::exitcode: 0"
+      bucket         = "kops-bucket-bhupen"
       key            = "kops/terraform.tfstate"
       region         = "ap-south-1"
-      dynamodb_table = "::debug::exitcode: 0"
+      dynamodb_table = "terraform-locks"
       encrypt        = true
     }
   }
