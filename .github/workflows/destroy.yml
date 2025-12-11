@@ -67,11 +67,37 @@ jobs:
           aws --version || true
         shell: bash
 
-      - name: Initialize terraform (infra-kops) to read outputs
+      - name: Initialize terraform (infra-kops) to read outputs (with backend-config)
+        env:
+          TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+          TF_STATE_KEY: ${{ secrets.TF_STATE_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           set -euxo pipefail
-          terraform -chdir=${{ env.TF_DIR }} init -input=false || true
-          terraform -chdir=${{ env.TF_DIR }} output -json > tf_outputs.json || true
+          cd "${{ env.TF_DIR }}"
+
+          # debug: show files so we can confirm variables.tf exists
+          echo "PWD: $(pwd)"
+          ls -la
+
+          # Use TF_BACKEND_BUCKET secret for backend init. If TF_STATE_KEY secret missing, fall back to sensible default.
+          KEY="${TF_STATE_KEY:-envs/prod/terraform.tfstate}"
+          if [ -n "${TF_BACKEND_BUCKET:-}" ]; then
+            echo "Initializing terraform with backend-config (bucket=${TF_BACKEND_BUCKET}, key=${KEY}, region=${AWS_REGION})"
+            terraform init \
+              -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+              -backend-config="key=${KEY}" \
+              -backend-config="region=${AWS_REGION}" \
+              -input=false || true
+          else
+            echo "TF_BACKEND_BUCKET not set — running terraform init without backend-config (best-effort)"
+            terraform init -input=false || true
+          fi
+
+          # dump outputs (best-effort)
+          terraform output -json > tf_outputs.json || true
         shell: bash
 
       - name: Read TF outputs for kops info
@@ -118,10 +144,23 @@ jobs:
         shell: bash
 
       - name: Terraform destroy infra-kops (destroy resources)
+        env:
+          # Provide module variable to Terraform runs so required variable backend_bucket_name is set
+          TF_VAR_backend_bucket_name: ${{ secrets.TF_BACKEND_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           set -euxo pipefail
           cd "${{ env.TF_DIR }}"
+
+          # debug: confirm variables file is present and Terraform files are visible
+          pwd
+          ls -la
+
+          # Plan destroy (picks up TF_VAR_backend_bucket_name from env)
           terraform plan -destroy -out=tfdestroy -input=false || true
+
           if [ -f tfdestroy ]; then
             terraform apply -auto-approve tfdestroy || terraform destroy -auto-approve -input=false || true
           else
@@ -131,12 +170,35 @@ jobs:
 
       - name: Optionally destroy bootstrap resources (S3 backend + DynamoDB)
         if: ${{ github.event.inputs.destroy_bootstrap == 'YES' }}
+        env:
+          TF_VAR_backend_bucket_name: ${{ secrets.TF_BACKEND_BUCKET }}
+          TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+          TF_STATE_KEY: ${{ secrets.TF_STATE_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           set -euxo pipefail
           echo "Destroying bootstrap resources in ${BOOTSTRAP_DIR} (S3 + DynamoDB)."
           if [ -d "${{ env.BOOTSTRAP_DIR }}" ]; then
             cd "${{ env.BOOTSTRAP_DIR }}"
-            terraform init -input=false || true
+
+            # debug
+            pwd
+            ls -la
+
+            # Init with backend-config for bootstrap state as well (if TF_BACKEND_BUCKET set)
+            KEY="${TF_STATE_KEY:-bootstrap/terraform.tfstate}"
+            if [ -n "${TF_BACKEND_BUCKET:-}" ]; then
+              terraform init \
+                -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+                -backend-config="key=${KEY}" \
+                -backend-config="region=${AWS_REGION}" \
+                -input=false || true
+            else
+              terraform init -input=false || true
+            fi
+
             terraform plan -destroy -out=tfdestroy -input=false || true
             if [ -f tfdestroy ]; then
               terraform apply -auto-approve tfdestroy || terraform destroy -auto-approve -input=false || true
