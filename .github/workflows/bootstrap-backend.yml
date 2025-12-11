@@ -53,21 +53,49 @@ jobs:
             -var="backend_bucket_name=${{ inputs.backend_bucket }}" \
             -var="dynamo_table_name=${{ inputs.dynamo_table }}" \
             -var="aws_region=${{ inputs.aws_region }}" \
-            -var="environment=${{ inputs.environment }}"
-
-      - name: Read created backend outputs
+            -var="environment=${{ inputs.environment }}"           
+      - name: Read created backend outputs (robust)
         id: state
         run: |
           set -euo pipefail
 
-          # Read outputs and take the last non-empty line (defensive against wrapper noise)
-          BUCKET=$(terraform -chdir=infra-bootstrap output backend_bucket | awk 'NF{line=$0} END{print line}')
-          TABLE=$(terraform -chdir=infra-bootstrap output dynamo_table | awk 'NF{line=$0} END{print line}')
+          # dump terraform outputs as JSON (suppress stderr)
+          terraform -chdir=infra-bootstrap output -json > /tmp/bootstrap_outputs.json 2>/dev/null || true
 
-          echo "Detected backend bucket: '${BUCKET}'"
-          echo "Detected dynamo table: '${TABLE}'"
+          # remove any runner debug lines that could contaminate the file (defensive)
+          # (some runners emit ::debug::... lines to stdout in rare cases)
+          sed '/^::debug::/d' /tmp/bootstrap_outputs.json > /tmp/bootstrap_outputs_clean.json || true
 
-          # Write outputs using the Actions file-output format (safe for multiline)
+          # ensure jq is available
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq not found — installing jq"
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+          # verify file is valid JSON
+          if ! jq empty /tmp/bootstrap_outputs_clean.json >/dev/null 2>&1; then
+            echo "ERROR: terraform output -json did not return valid JSON. Contents:"
+            sed -n '1,200p' /tmp/bootstrap_outputs_clean.json || true
+            exit 1
+          fi
+
+          # extract values we expect
+          BUCKET=$(jq -r '.backend_bucket.value // empty' /tmp/bootstrap_outputs_clean.json)
+          TABLE=$(jq -r '.dynamo_table.value // empty' /tmp/bootstrap_outputs_clean.json)
+
+          echo "Raw outputs (for debug):"
+          echo "bucket:'$BUCKET'"
+          echo "table:'$TABLE'"
+
+          if [ -z "$BUCKET" ] || [ -z "$TABLE" ]; then
+            echo "ERROR: expected outputs 'backend_bucket' and 'dynamo_table' not present in terraform outputs."
+            echo "Dumping cleaned terraform output to logs for debugging:"
+            sed -n '1,200p' /tmp/bootstrap_outputs_clean.json || true
+            exit 1
+          fi
+
+          # write in actions file-output safe format
           echo "bucket<<EOF" >> $GITHUB_OUTPUT
           echo "$BUCKET" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -75,6 +103,7 @@ jobs:
           echo "table<<EOF" >> $GITHUB_OUTPUT
           echo "$TABLE" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+
 
       - name: Create backend.tf for infra-kops
         run: |
