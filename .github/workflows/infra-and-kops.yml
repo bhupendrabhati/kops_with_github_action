@@ -272,30 +272,71 @@ jobs:
           KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
         shell: bash
 
-      - name: Create or update kops cluster (idempotent)
+      - name: Create or update kops cluster (idempotent, robust)
         env:
           KOPS_STATE_STORE: ${{ steps.tf.outputs.KOPS_STATE_STORE }}
           CLUSTER_NAME: ${{ steps.tf.outputs.CLUSTER_NAME }}
         run: |
           set -euo pipefail
-          # Substitute environment variables in cluster.yml template
+
+          # Prepare cluster.yml if present
           if [ -f infra-kops/cluster.yml ]; then
             echo "Preparing cluster.yml with environment variables..."
             mkdir -p /tmp/kops-config
             envsubst < infra-kops/cluster.yml > /tmp/kops-config/cluster-prepared.yml
-            echo "Applying prepared cluster configuration..."
-            kops replace -f /tmp/kops-config/cluster-prepared.yml --state="${KOPS_STATE_STORE}" || true
+            echo "Prepared: /tmp/kops-config/cluster-prepared.yml"
+            # show first lines for debugging
+            sed -n '1,120p' /tmp/kops-config/cluster-prepared.yml || true
           fi
 
-          if kops get cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" > /dev/null 2>&1; then
-            echo "Cluster exists; running update..."
-            kops update cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --yes
-          else
-            echo "Cluster not found; creating with fallback defaults"
-            # adapt zone/node-count/size to your needs
-            kops create cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --zones "ap-south-1a,ap-south-1b,ap-south-1c" --node-count 2 --node-size t3.small --yes
+          # Try to apply the prepared config with 'replace' (non-fatal)
+          if [ -f /tmp/kops-config/cluster-prepared.yml ]; then
+            echo "Attempting kops replace -f (non-fatal if parsing fails)..."
+            # If parsing fails, kops returns non-zero; do not abort the script here.
+            kops replace -f /tmp/kops-config/cluster-prepared.yml --state="${KOPS_STATE_STORE}" || echo "kops replace produced an error (continuing)"
           fi
+
+          # Determine whether cluster exists already
+          if kops get cluster --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" > /dev/null 2>&1; then
+            echo "Cluster ${CLUSTER_NAME} already exists in state store; running update..."
+            kops update cluster --name "${CLUSTER_NAME}" --state="${KOPS_STATE_STORE}" --yes
+            CREATED=false
+          else
+            echo "Cluster ${CLUSTER_NAME} not found in state store; attempting creation."
+
+            # If we have a prepared cluster YAML, attempt create from file (preferred).
+            if [ -f /tmp/kops-config/cluster-prepared.yml ]; then
+              echo "Trying to create cluster from prepared cluster.yml (explicit --state and --cloud aws)."
+              # Attempt create from file first; if it fails, fall back to 'kops create cluster' with flags.
+              if kops create -f /tmp/kops-config/cluster-prepared.yml --state="${KOPS_STATE_STORE}" --cloud aws; then
+                echo "Created cluster from YAML."
+              else
+                echo "Create from YAML failed; falling back to 'kops create cluster' CLI defaults."
+                kops create cluster --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" --zones "ap-south-1a,ap-south-1b,ap-south-1c" --node-count 2 --node-size t3.small --yes --cloud aws
+              fi
+            else
+              # No cluster.yml present — create with CLI flags and explicit cloud.
+              kops create cluster --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" --zones "ap-south-1a,ap-south-1b,ap-south-1c" --node-count 2 --node-size t3.small --yes --cloud aws
+            fi
+            CREATED=true
+          fi
+
+          # Export kubeconfig (best-effort)
+          echo "Exporting kubeconfig (best-effort)..."
+          kops export kubeconfig --name "${CLUSTER_NAME}" --state "${KOPS_STATE_STORE}" || echo "kops export kubeconfig failed (continuing)"
+
+          # If an SSH pubkey is provided, create the kops secret now (only after cluster exists)
+          if [ -n "${{ secrets.KOPS_SSH_PUBLIC_KEY }}" ]; then
+            echo "Creating kops SSH secret from provided secret..."
+            echo "${{ secrets.KOPS_SSH_PUBLIC_KEY }}" > /tmp/kops.pub
+            kops create secret --name "${CLUSTER_NAME}" sshpublickey admin -i /tmp/kops.pub --state="${KOPS_STATE_STORE}" || echo "kops create secret failed (continuing)"
+          else
+            echo "No KOPS_SSH_PUBLIC_KEY provided; skipping SSH secret creation."
+          fi
+
+          echo "Create/update step completed. CREATED=${CREATED}"
         shell: bash
+
 
       - name: Export kubeconfig and validate (non-blocking)
         env:
